@@ -141,7 +141,65 @@ Inspiración buena: La lógica del `ElementProcessor` del viejo graph-mode era d
 - **Complejidad de bloques de Notion**: Empezar con los bloques más comunes (paragraph, heading, toggle, child_page, mention). Ir agregando más según necesidad.
 - **UI/UX del grafo**: Es fácil hacer un grafo feo o que no se pueda navegar. Dedicar tiempo real a interacciones y filtros.
 
-## Próximos Pasos Inmediatos (Esta Sesión)
+## Iteración Actual (Junio 2026): Persistencia de Layout + Menú de Nodos (SleepBox)
+
+**Objetivo de esta iteración**  
+Hacer que el grafo sea usable a largo plazo: el usuario puede pinear nodos manualmente y que esas posiciones se guarden en la misma base SQLite que usa para el contenido. Además, poder interactuar con los nodos de forma más rica (menú contextual).
+
+### Requisitos del usuario
+- Mostrar títulos de los nodos de forma clara.
+- Poder pinear nodos (arrastrar y que queden fijos).
+- **Persistencia real**: las posiciones pineadas deben guardarse en la base de datos SQLite → al levantar la app de nuevo, los nodos aparecen donde los dejó.
+- Click en un nodo → mostrar menú.
+- Opción principal del menú: **"Ir al nodo en Notion"** (abrir la página real).
+
+### Plan de Implementación (en este orden)
+
+**Paso 1 – Esquema de Datos (SQLite)**
+- Agregar tabla `node_positions` al generador de la base limpia (`build_clean_fresh_graph.js`).
+- Esquema recomendado:
+  ```sql
+  CREATE TABLE node_positions (
+    node_id     TEXT PRIMARY KEY,
+    x           REAL NOT NULL,
+    y           REAL NOT NULL,
+    pinned_at   INTEGER,           -- unix timestamp
+    is_pinned   BOOLEAN DEFAULT 1
+  );
+  ```
+- Esta tabla vive dentro del mismo archivo `SleepBox_Graph_Ready_Cleaned_....sqlite`.
+- Actualizar documentación del esquema en este PLAN.md y en el script.
+
+**Paso 2 – Carga y Guardado de Posiciones en el Frontend**
+- Extender `src/lib/sqliteCache.ts` (o crear helpers específicos) para leer/escribir `node_positions`.
+- En `GraphDemo.tsx`:
+  - Al cargar el grafo desde SQLite, aplicar `fx`/`fy` a los nodos según lo guardado.
+  - En `handleNodeDragEnd`: guardar automáticamente la posición en la tabla.
+  - Agregar botón "Unpin este nodo" y mejorar "Unpin all".
+- El pinning debe sobrevivir recargas de la página / reinicios de la app.
+
+**Paso 3 – Menú Contextual + "Ir a Notion"**
+- Implementar menú al hacer click (idealmente derecho, o izquierdo + botón secundario).
+- Opciones mínimas:
+  - **Abrir en Notion** (construir URL con el `id` del nodo).
+  - Pin / Unpin este nodo.
+  - Copiar título / ID.
+- Usar `onNodeRightClick` de react-force-graph + un componente React posicionado (portal o div absoluto).
+
+**Paso 4 – Pulido de Títulos y Experiencia**
+- Mejorar el renderizado de labels (`nodeCanvasObject`) cuando hay nodos pineados (ej: icono de pin, mejor separación).
+- Asegurar que los títulos se vean bien en grafos densos como el de las 55+ Tarjetas de SleepBox.
+- Pequeños ajustes de UX (feedback visual al pinear, etc.).
+
+**Entregable de la iteración**
+Una versión del grafo donde:
+- El usuario puede organizar manualmente las galaxias de temas pineando nodos importantes.
+- Al recargar, el layout manual se mantiene.
+- Puede navegar rápido a Notion desde cualquier nodo con un click.
+
+---
+
+## Próximos Pasos Inmediatos (Histórico - ya superado)
 
 1. Terminar setup base (Tailwind, estructura de carpetas).
 2. Crear componentes básicos de layout (Sidebar + Graph area).
@@ -151,6 +209,6 @@ Inspiración buena: La lógica del `ElementProcessor` del viejo graph-mode era d
 
 ---
 
-**Estado actual**: Opción A confirmada. Enfocados 100% en herramienta local privada.
+**Estado actual de la iteración (Jun 2026)**: En progreso. Enfocados en hacer el grafo "vivible" a través del tiempo mediante persistencia de layout manual + interacción directa con Notion.
 
-¿Listo para empezar a codear la Fase 0/1?
+**Siguiente acción**: Ejecutar los 4 pasos en orden.

@@ -1,22 +1,43 @@
 import { useState, useRef, useEffect } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import { buildGraphFromPage, fetchDirectRelations } from '../lib/notion';
+import { InMemoryPageCache } from '../lib/cache';
+import { getOrRefreshHighLevelThemes, processTarjetasForThemes } from '../lib/themeInference';
+import * as sqliteCache from '../lib/sqliteCache'; // real SQLite cache for debugging + node positions persistence
 
 export default function GraphDemo() {
   const [graphData, setGraphData] = useState<any>(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [pageInput, setPageInput] = useState('');
+  const [pageInput, setPageInput] = useState('c51020805fb849e7a9e41208cae7cdc1'); // Default: user's Tabla view
   const [error, setError] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<any>(null);
   const [hoveredNode, setHoveredNode] = useState<any>(null);
+
+  // Context menu state (right click on node)
+  const [contextMenu, setContextMenu] = useState<{
+    node: any;
+    x: number;
+    y: number;
+  } | null>(null);
   const fgRef = useRef<any>(null);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
-  const [loadDepth, setLoadDepth] = useState(3); // New: adjustable depth when loading a page/DB
+  const [loadDepth, setLoadDepth] = useState(3);
+
+  // Persistent cache for the session
+  const cacheRef = useRef(new InMemoryPageCache());
+
+  // Theme inference results (for debugging + UI)
+  const [themeDebugInfo, setThemeDebugInfo] = useState<{
+    highLevelThemes: string[];
+    assignedCount: number;
+    totalTarjetas: number;
+    themeCounts: Record<string, number>;
+  } | null>(null);
 
   // Live visualization tuning controls
   const [visualSettings, setVisualSettings] = useState({
     labelSeparation: 8,           // base vertical separation (higher = more space above node)
-    fontSizeBase: 10,             // base font size before zoom scaling (bajado para grafos densos)
+    fontSizeBase: 11,             // base font size (more direct control now)
     bgOpacity: 0.92,              // label background opacity
     zoomThreshold: 2.0,           // minimum globalScale to show labels
     showConnector: true,          // draw line from node to label
@@ -78,8 +99,10 @@ export default function GraphDemo() {
     fg.d3ReheatSimulation?.();
   }, [currentData, visualSettings.nodeCharge]);
 
-  const handleLoadReal = async () => {
-    if (!pageInput.trim()) {
+  const handleLoadReal = async (forcedId?: string) => {
+    const idToLoad = forcedId || pageInput;
+
+    if (!idToLoad.trim()) {
       setError('Please paste a Notion page URL or ID');
       return;
     }
@@ -89,24 +112,195 @@ export default function GraphDemo() {
 
     try {
       // Extract ID from URL if needed
-      const idMatch = pageInput.match(/[0-9a-f]{32}/i) || pageInput.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-      const entityId = idMatch ? idMatch[0].replace(/-/g, '') : pageInput.trim();
+      const idMatch = idToLoad.match(/[0-9a-f]{32}/i) || idToLoad.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+      const entityId = idMatch ? idMatch[0].replace(/-/g, '') : idToLoad.trim();
 
       const result = await buildGraphFromPage(entityId, loadDepth, { shallowDatabase: true });
 
-      // Convert to format expected by ForceGraph2D
+      if (result.isLargeDatabase) {
+        console.info('Large database detected — loaded in shallow mode');
+      }
+
+      // === Theme Inference (hybrid: sparse "Temáticas" + title prefixes) ===
+      // This must happen BEFORE setting the graph data.
+      let enrichedNodes = result.nodes;
+
+      try {
+        const cache = cacheRef.current;
+
+        // Focus theme inference primarily on *core* Tarjetas (the actual rows of the Tabla database).
+        // The other nodes are things linked via Fuentes/Anécdotas/etc. — they can inherit later.
+        const coreTarjetaNodes = result.nodes.filter((n: any) => n.isCoreTarjeta === true);
+        const otherRelatedNodes = result.nodes.filter((n: any) => n.label && !n.type?.includes('database') && !n.isCoreTarjeta);
+        const titles = coreTarjetaNodes.map((n: any) => n.label);
+
+        const { seenPrefixes } = processTarjetasForThemes(titles, []);
+
+        const highLevelThemes = await getOrRefreshHighLevelThemes(
+          entityId,
+          cache,
+          seenPrefixes
+        );
+
+        // Persist to real SQLite DB so the user can inspect the actual file
+        try {
+          await sqliteCache.saveHighLevelThemes(highLevelThemes, Date.now());
+        } catch (e) {
+          console.warn('Failed to persist themes to SQLite', e);
+        }
+
+        if (highLevelThemes.length > 0) {
+          console.groupCollapsed('%c[Theme Inference] High-level Temáticas (from sparse property + cache)', 'color:#10b981; font-weight:bold');
+          highLevelThemes.forEach(t => console.log(`  • ${t}`));
+          console.groupEnd();
+        }
+
+        const { assignments } = processTarjetasForThemes(titles, highLevelThemes);
+
+        let assignedCount = 0;
+
+        // Create a new array with enriched nodes (don't mutate the original result)
+        enrichedNodes = result.nodes.map((node: any) => {
+          if (!node.isCoreTarjeta) {
+            // Non-core nodes (linked sources, etc.) keep their data but don't get primary theme treatment here
+            return { ...node, val: node.type === 'database' ? 8 : 4 };
+          }
+
+          // Find the corresponding assignment for this core Tarjeta
+          const idx = coreTarjetaNodes.findIndex((t: any) => t.id === node.id);
+          const assignment = idx >= 0 ? assignments[idx] : null;
+
+          const enriched = { ...node, val: 4 };
+
+          if (assignment?.theme) {
+            enriched.inferredTheme = assignment.theme;
+            enriched.themePrefix = assignment.prefix;
+            assignedCount++;
+          } else if (assignment?.prefix) {
+            enriched.themePrefix = assignment.prefix;
+            enriched.inferredTheme = `Unknown theme (${assignment.prefix})`;
+          }
+
+          return enriched;
+        });
+
+        console.log(
+          `%c[Theme Inference] Attached theme to ${assignedCount}/${coreTarjetaNodes.length} core Tarjetas (hybrid: sparse values + title prefixes). ${otherRelatedNodes.length} related nodes loaded separately.`,
+          'color:#8b5cf6'
+        );
+
+        // Build per-theme counts for the debug panel (only core Tarjetas)
+        const themeCounts: Record<string, number> = {};
+        enrichedNodes.forEach((n: any) => {
+          if (n.isCoreTarjeta && n.inferredTheme && !n.inferredTheme.startsWith('Unknown')) {
+            themeCounts[n.inferredTheme] = (themeCounts[n.inferredTheme] || 0) + 1;
+          }
+        });
+
+        setThemeDebugInfo({
+          highLevelThemes,
+          assignedCount,
+          totalTarjetas: coreTarjetaNodes.length,
+          themeCounts,
+        });
+
+        // Persist per-Tarjeta assignments to SQLite for debugging/inspection (only core ones)
+        try {
+          const assignmentsForDb = coreTarjetaNodes.map((node: any, i: number) => {
+            const a = assignments[i];
+            return {
+              id: node.id,
+              title: node.label,
+              inferredTheme: a?.theme ?? null,
+              themePrefix: a?.prefix ?? null,
+              source: a?.source ?? 'unknown',
+            };
+          });
+          await sqliteCache.saveManyTarjetaAssignments(assignmentsForDb, Date.now());
+        } catch (e) {
+          console.warn('Failed to save Tarjeta assignments to SQLite', e);
+        }
+      } catch (e) {
+        console.warn('[Theme Inference] Could not run theme assignment', e);
+        // Fallback: still render the graph even if theme inference fails
+        enrichedNodes = result.nodes.map(n => ({
+          ...n,
+          val: n.type === 'database' ? 8 : 4
+        }));
+      }
+
+      // Now build and set the final graph data (with themes attached)
+      let finalNodes = enrichedNodes;
+      let finalLinks = result.links.map(l => ({ ...l }));
+
+      // === Visual Galaxies: Create virtual "Theme" hub nodes ===
+      // This is the key to seeing the "galaxias de conceptos" structure.
+      try {
+        const themeMap = new Map<string, any[]>();
+
+        enrichedNodes.forEach((node: any) => {
+          if (node.inferredTheme && !node.inferredTheme.startsWith('Unknown')) {
+            if (!themeMap.has(node.inferredTheme)) {
+              themeMap.set(node.inferredTheme, []);
+            }
+            themeMap.get(node.inferredTheme)!.push(node);
+          }
+        });
+
+        if (themeMap.size > 0) {
+          const virtualThemeNodes: any[] = [];
+          const virtualThemeLinks: any[] = [];
+
+          themeMap.forEach((cards, themeName) => {
+            const themeId = `theme-${themeName.replace(/\s+/g, '-')}`;
+
+            // Create a virtual hub node for the theme
+            virtualThemeNodes.push({
+              id: themeId,
+              label: themeName,
+              type: 'theme',
+              val: Math.max(6, Math.min(14, Math.sqrt(cards.length) + 3)),
+              isVirtualTheme: true,
+            });
+
+            // Connect every card of this theme to the hub (weak structural link)
+            cards.forEach((card: any) => {
+              virtualThemeLinks.push({
+                source: themeId,
+                target: card.id,
+                relationType: 'in_theme',
+                isVirtual: true,
+              });
+            });
+          });
+
+          finalNodes = [...enrichedNodes, ...virtualThemeNodes];
+          finalLinks = [...finalLinks, ...virtualThemeLinks];
+
+          console.log(`%c[Theme Inference] Created ${virtualThemeNodes.length} virtual theme hubs for galaxy view`, 'color:#f59e0b');
+        }
+      } catch (e) {
+        console.warn('[Theme Inference] Failed to create virtual theme hubs', e);
+      }
+
       const formatted = {
-        nodes: result.nodes.map(n => ({ ...n, val: n.type === 'database' ? 8 : 4 })),
-        links: result.links.map(l => ({ ...l })),
+        nodes: finalNodes,
+        links: finalLinks,
       };
 
       setGraphData(formatted);
       setSelectedNode(null);
 
-      if (result.isLargeDatabase) {
-        // We can show a non-blocking warning later
-        console.info('Large database detected — loaded in shallow mode');
-      }
+      // Apply any previously pinned positions (from SQLite cache)
+      // This makes manual layout survive page reloads
+      setTimeout(async () => {
+        try {
+          await sqliteCache.applySavedPositionsToNodes(finalNodes);
+          if (fgRef.current?.refresh) fgRef.current.refresh();
+        } catch (e) {
+          console.warn('Failed to apply saved node positions', e);
+        }
+      }, 80);
     } catch (err: any) {
       console.error(err);
       let friendlyMessage = err.message || 'Failed to load from Notion.';
@@ -122,6 +316,26 @@ export default function GraphDemo() {
       setIsLoading(false);
     }
   };
+
+  // Auto-load the user's default Tabla view once on startup
+  const hasAutoLoadedRef = useRef(false);
+  const DEFAULT_DB_ID = 'c51020805fb849e7a9e41208cae7cdc1';
+
+  useEffect(() => {
+    if (!hasAutoLoadedRef.current) {
+      hasAutoLoadedRef.current = true;
+
+      // Force the default ID and trigger load
+      setPageInput(DEFAULT_DB_ID);
+
+      const timer = setTimeout(() => {
+        // Call directly with the ID to avoid any closure/state timing issues
+        handleLoadReal(DEFAULT_DB_ID);
+      }, 300);
+
+      return () => clearTimeout(timer);
+    }
+  }, []); // run only once, handleLoadReal will use the updated pageInput
 
   const handleNodeClick = async (node: any) => {
     setSelectedNode(node);
@@ -176,10 +390,17 @@ export default function GraphDemo() {
   };
 
   // Pin node in place when user finishes dragging it
-  const handleNodeDragEnd = (node: any) => {
+  const handleNodeDragEnd = async (node: any) => {
     // Fix the node position so force simulation doesn't move it anymore
     node.fx = node.x;
     node.fy = node.y;
+
+    // Persist to SQLite (survives reloads)
+    try {
+      await sqliteCache.saveNodePosition(node.id, node.x, node.y);
+    } catch (e) {
+      console.warn('Could not persist node position to SQLite cache', e);
+    }
 
     // Force a refresh so the UI reflects the pinned state if needed
     if (fgRef.current?.refresh) {
@@ -187,13 +408,20 @@ export default function GraphDemo() {
     }
   };
 
-  const unpinAllNodes = () => {
+  const unpinAllNodes = async () => {
     if (!graphData) return;
 
     graphData.nodes.forEach((node: any) => {
       delete node.fx;
       delete node.fy;
     });
+
+    // Also clear persisted positions
+    try {
+      await sqliteCache.unpinAllNodes();
+    } catch (e) {
+      console.warn('Could not clear persisted positions', e);
+    }
 
     // Reheat simulation so nodes can move again
     setGraphData({ ...graphData }); // trigger re-render
@@ -208,6 +436,41 @@ export default function GraphDemo() {
     setPageInput('');
     setError(null);
     setLoadDepth(3); // reset depth too
+    setContextMenu(null);
+  };
+
+  // === Context Menu Actions ===
+  const closeContextMenu = () => setContextMenu(null);
+
+  const openInNotion = (node: any) => {
+    if (!node?.id) return;
+    // Clean ID and build Notion URL (Notion handles the redirect)
+    const cleanId = node.id.replace(/-/g, '');
+    const url = `https://www.notion.so/${cleanId}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+    closeContextMenu();
+  };
+
+  const pinNodeFromMenu = async (node: any) => {
+    if (!node) return;
+    node.fx = node.x;
+    node.fy = node.y;
+    try {
+      await sqliteCache.saveNodePosition(node.id, node.x, node.y);
+    } catch (e) {}
+    if (fgRef.current?.refresh) fgRef.current.refresh();
+    closeContextMenu();
+  };
+
+  const unpinNodeFromMenu = async (node: any) => {
+    if (!node) return;
+    delete node.fx;
+    delete node.fy;
+    try {
+      await sqliteCache.unpinNode(node.id);
+    } catch (e) {}
+    if (fgRef.current?.refresh) fgRef.current.refresh();
+    closeContextMenu();
   };
 
   return (
@@ -224,7 +487,7 @@ export default function GraphDemo() {
             onKeyDown={(e) => e.key === 'Enter' && handleLoadReal()}
           />
           <button 
-            onClick={handleLoadReal} 
+            onClick={() => handleLoadReal()} 
             disabled={isLoading}
             className="btn"
           >
@@ -257,33 +520,73 @@ export default function GraphDemo() {
           </div>
         )}
 
-        <div className="flex-1">
+        <div className="flex-1" onClick={() => setContextMenu(null)}>
           <ForceGraph2D
             ref={fgRef}
             graphData={currentData}
             nodeColor={(node: any) => {
-              if (node.group) {
-                // Colorear consistentemente por el grupo (Temática)
-                const hash = node.group.split('').reduce((a: number, c: string) => a + c.charCodeAt(0), 0);
-                const hue = (hash * 37) % 360; // mejor distribución
-                return `hsl(${hue}, 65%, 58%)`;
+              if (node.isVirtualTheme) {
+                return '#f59e0b'; // Amber/gold for theme hubs — stands out
+              }
+
+              const theme = node.inferredTheme || node.group;
+
+              if (theme) {
+                const hash = theme.split('').reduce((a: number, c: string) => a + c.charCodeAt(0), 0);
+                const hue = (hash * 37) % 360;
+                return `hsl(${hue}, 68%, 55%)`;
               }
               return node.type === 'database' ? '#10b981' : '#3b82f6';
             }}
             nodeRelSize={currentData.nodes.length > 400 ? 3.5 : 5.5}
             linkColor={(link: any) => {
               const rel = link.relationType || link.type;
-              if (rel?.startsWith('explicit')) return '#f59e0b';      // Orange for explicit
-              if (rel === 'mention') return '#8b5cf6';                // Purple for implicit mentions
-              if (rel === 'child_page' || rel === 'child') return '#3b82f6'; // Blue
-              return '#6b7280';                                       // Gray default
+              const cat = link.category;
+
+              if (link.isVirtual) {
+                return 'rgba(245, 158, 11, 0.35)'; // Subtle gold for theme hub connections
+              }
+
+              // Contradicciones / tensión (Fuentes terciarias) → rojo intenso
+              if (rel === 'explicit:fuentes_terciarias' || cat === 'contradiction') {
+                return '#ef4444';
+              }
+
+              // Explicit support (primarias/secundarias) → naranja/ámbar cálido
+              if (rel?.startsWith('explicit') || cat === 'support') {
+                return '#f59e0b';
+              }
+
+              if (rel === 'mention') return '#8b5cf6';
+              if (rel === 'child_page' || rel === 'child') return '#3b82f6';
+              return '#6b7280';
             }}
             linkWidth={(link: any) => {
+              if (link.isVirtual) {
+                return currentData?.nodes?.length > 400 ? 0.6 : 1.0; // Thin for theme hub connections
+              }
+
               const rel = link.relationType || link.type;
-              if (rel?.startsWith('explicit')) return currentData.nodes.length > 400 ? 1.2 : 1.8;
+              const cat = link.category;
+
+              if (rel === 'explicit:fuentes_terciarias' || cat === 'contradiction') {
+                return currentData.nodes.length > 400 ? 1.4 : 2.0;
+              }
+              if (rel?.startsWith('explicit') || cat === 'support' || cat === 'membership') {
+                return currentData.nodes.length > 400 ? 1.2 : 1.8;
+              }
               return currentData.nodes.length > 400 ? 0.7 : 1.2;
             }}
             onNodeClick={handleNodeClick}
+            onNodeRightClick={(node: any, event: any) => {
+              // Show context menu
+              setContextMenu({
+                node,
+                x: event.pageX || event.clientX,
+                y: event.pageY || event.clientY,
+              });
+              setSelectedNode(node);
+            }}
             onNodeDragEnd={handleNodeDragEnd}
             onNodeHover={setHoveredNode}
             cooldownTicks={currentData.nodes.length > 600 ? 50 : 100}
@@ -295,9 +598,13 @@ export default function GraphDemo() {
             nodeCanvasObject={(node: any, ctx, globalScale) => {
               const isDatabase = node.type === 'database';
               const nodeScale = currentData.nodes.length > 400 ? visualSettings.largeGraphNodeScale : 1;
-              const radius = (isDatabase ? 8 : 5) * nodeScale;
+
+              // Make the root Sleep Box / DB node visually lighter when we have Temáticas grouping
+              const isSleepBoxRoot = isDatabase && node.label?.includes('(DB)');
+              const radius = (isDatabase ? (isSleepBoxRoot ? 5 : 9) : 5) * nodeScale;
               const label = node.label || '';
-              const fontSize = Math.max(8, visualSettings.fontSizeBase / globalScale);
+              // Much more direct font size control — the slider now has stronger effect
+              const fontSize = Math.max(6, visualSettings.fontSizeBase * (0.8 + Math.min(globalScale, 4) * 0.12));
               const isExpanded = expandedNodes.has(node.id);
 
               // Draw node circle
@@ -313,6 +620,14 @@ export default function GraphDemo() {
                 ctx.stroke();
               }
 
+              // Small pin indicator for manually pinned nodes (fx/fy set)
+              if (node.fx != null && node.fy != null) {
+                ctx.fillStyle = '#f59e0b';
+                ctx.beginPath();
+                ctx.arc(node.x - radius * 0.75, node.y + radius * 0.75, 2.2 / globalScale, 0, 2 * Math.PI);
+                ctx.fill();
+              }
+
               // Small + indicator for unexpanded nodes (except the root database)
               if (!isExpanded && !isDatabase) {
                 ctx.fillStyle = '#fbbf24';
@@ -322,13 +637,14 @@ export default function GraphDemo() {
               }
 
               // Show label only on hover or when zoomed in enough
-              const effectiveThreshold = currentData.nodes.length > 400 
-                ? Math.max(visualSettings.zoomThreshold, 1.5) 
+              const effectiveThreshold = currentData.nodes.length > 200 
+                ? Math.max(visualSettings.zoomThreshold, 2.8)   // Much stricter for dense views like your Tabla
                 : visualSettings.zoomThreshold;
 
               const showLabel = 
                 hoveredNode?.id === node.id || 
-                globalScale > effectiveThreshold;
+                globalScale > effectiveThreshold ||
+                (node.isVirtualTheme && globalScale > 0.8); // Always try to show theme hubs
 
               if (showLabel && label) {
                 ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
@@ -388,6 +704,51 @@ export default function GraphDemo() {
             }}
           />
         </div>
+
+        {/* Context Menu (right-click on node) */}
+        {contextMenu && (
+          <div
+            className="fixed z-50 bg-[#1f222b] border border-[#3a3f4a] rounded-lg shadow-xl py-1 text-sm min-w-[180px]"
+            style={{ left: contextMenu.x + 4, top: contextMenu.y + 4 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-3 py-1.5 text-[#9ca3af] text-xs border-b border-[#3a3f4a] truncate">
+              {contextMenu.node?.label || contextMenu.node?.id}
+            </div>
+
+            <button
+              onClick={() => openInNotion(contextMenu.node)}
+              className="w-full text-left px-3 py-1.5 hover:bg-[#2a2d36] flex items-center gap-2"
+            >
+              <span>→</span> <span>Abrir en Notion</span>
+            </button>
+
+            {contextMenu.node?.fx != null ? (
+              <button
+                onClick={() => unpinNodeFromMenu(contextMenu.node)}
+                className="w-full text-left px-3 py-1.5 hover:bg-[#2a2d36]"
+              >
+                Despinear este nodo
+              </button>
+            ) : (
+              <button
+                onClick={() => pinNodeFromMenu(contextMenu.node)}
+                className="w-full text-left px-3 py-1.5 hover:bg-[#2a2d36]"
+              >
+                Pinear en esta posición
+              </button>
+            )}
+
+            <div className="border-t border-[#3a3f4a] my-1" />
+
+            <button
+              onClick={closeContextMenu}
+              className="w-full text-left px-3 py-1.5 hover:bg-[#2a2d36] text-[#9ca3af]"
+            >
+              Cerrar
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Sidebar */}
@@ -395,7 +756,7 @@ export default function GraphDemo() {
         <h3 className="font-semibold text-lg mb-2">Notion Graph</h3>
         <div className="text-xs text-[#6b7280] mb-4 flex items-center justify-between">
           <span>
-            {graphData ? 'Real data from your Notion' : 'Demo mode — click "Load Real Graph" after setting up your token'}
+            {graphData ? 'Real data from your Tabla view (with theme galaxies)' : 'Demo mode — click "Load Real Graph" after setting up your token'}
           </span>
           {currentData?.nodes && (
             <span className="font-mono bg-[#0f1117] px-1.5 py-0.5 rounded text-[10px]">
@@ -413,8 +774,9 @@ export default function GraphDemo() {
         <div className="mb-6">
           <div className="text-xs uppercase tracking-widest text-[#6b7280] mb-2">Legend</div>
           <div className="space-y-1.5 text-sm">
-            <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-[#3b82f6]" /> Page</div>
+            <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-[#3b82f6]" /> Page / Tarjeta</div>
             <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-[#10b981]" /> Database</div>
+            <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-[#f59e0b]" /> Theme hub (galaxy center)</div>
             <div className="flex items-center gap-2 text-[#6b7280]"><div className="w-6 h-px bg-[#4b5563]" /> Child / Mention</div>
           </div>
           <div className="mt-3 text-[10px] text-[#6b7280]">
@@ -425,15 +787,68 @@ export default function GraphDemo() {
           <div className="mt-2 text-[10px]">
             <div className="text-[#6b7280] mb-1">Link types:</div>
             <div className="flex flex-col gap-0.5">
-              <div className="flex items-center gap-1.5"><div className="w-3 h-0.5 bg-orange-500" /> Explicit (Sleep Box)</div>
+              <div className="flex items-center gap-1.5"><div className="w-3 h-0.5 bg-orange-500" /> Explicit - Apoyo (primarias/secundarias)</div>
+              <div className="flex items-center gap-1.5"><div className="w-3 h-0.5 bg-red-500" /> Contradicción (fuentes terciarias)</div>
               <div className="flex items-center gap-1.5"><div className="w-3 h-0.5 bg-purple-500" /> Implicit (mentions)</div>
               <div className="flex items-center gap-1.5"><div className="w-3 h-0.5 bg-blue-500" /> Child / Containment</div>
+              <div className="flex items-center gap-1.5"><div className="w-3 h-0.5 bg-amber-500" /> Theme galaxy (virtual hub)</div>
+            </div>
+            <div className="mt-1 text-[9px] text-[#6b7280]">
+              Gold hubs = high-level Temas (created from sparse "Temáticas" + title prefixes).
             </div>
           </div>
 
-          {currentData?.nodes?.some((n: any) => n.group) && (
+          {(currentData?.nodes?.some((n: any) => n.inferredTheme) || currentData?.nodes?.some((n: any) => n.group)) && (
             <div className="mt-2 text-[10px] text-[#6b7280]">
-              Nodes are colored by their "Temáticas" group from the database.
+              Nodes are colored by inferred high-level theme (title prefix + sparse "Temáticas" property).
+            </div>
+          )}
+
+          {/* Theme Inference Debug Panel */}
+          {themeDebugInfo && (
+            <div className="mt-4 p-3 border border-[#2a2d36] rounded bg-[#0f1117] text-[11px]">
+              <div className="font-medium text-[#9ca3af] mb-2">Theme Inference (debug)</div>
+
+              <div className="text-[#6b7280] mb-1">
+                Themes found: <span className="text-white font-mono">{themeDebugInfo.highLevelThemes.length}</span>
+                &nbsp;•&nbsp;
+                Assigned: <span className="text-white font-mono">{themeDebugInfo.assignedCount}/{themeDebugInfo.totalTarjetas}</span>
+              </div>
+
+              {Object.keys(themeDebugInfo.themeCounts).length > 0 && (
+                <div className="mt-2 space-y-0.5 max-h-40 overflow-auto text-[10px]">
+                  {Object.entries(themeDebugInfo.themeCounts)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([theme, count]) => (
+                      <div key={theme} className="flex justify-between">
+                        <span className="truncate pr-2">{theme}</span>
+                        <span className="font-mono text-[#9ca3af] shrink-0">{count}</span>
+                      </div>
+                    ))}
+                </div>
+              )}
+
+              {themeDebugInfo.highLevelThemes.length === 0 && (
+                <div className="text-amber-400 mt-1">No themes discovered from sparse "Temáticas" property.</div>
+              )}
+
+              <div className="mt-2 flex gap-2">
+                <button
+                  onClick={() => sqliteCache.exportDatabase()}
+                  className="text-[10px] px-2 py-0.5 border border-[#3a3d46] rounded hover:bg-[#1f2937]"
+                >
+                  Export Cache DB (.sqlite)
+                </button>
+                <button
+                  onClick={async () => {
+                    await sqliteCache.clearAll();
+                    alert('Cache DB cleared. Reload to start fresh.');
+                  }}
+                  className="text-[10px] px-2 py-0.5 border border-[#3a3d46] rounded hover:bg-[#1f2937] text-red-400"
+                >
+                  Clear Cache
+                </button>
+              </div>
             </div>
           )}
         </div>
