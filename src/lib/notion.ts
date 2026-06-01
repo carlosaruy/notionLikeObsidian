@@ -1,6 +1,9 @@
 // Client for talking to Notion through our secure Vite dev proxy
 // In development, calls go to /notion-api/... which the proxy forwards with the token from .env
 
+import type { RelationType, RelationCategory } from './relationTypes';
+import { normalizeExplicitRelationType, getRelationCategory, getSemanticLabel } from './relationTypes';
+
 const API_BASE = '/notion-api/v1';
 
 export interface NotionPage {
@@ -16,6 +19,7 @@ export interface GraphNode {
   notionUrl?: string;
   layer?: 'borradores' | 'sleepbox' | 'other';
   group?: string;           // Nueva: categoría/temática principal a la que pertenece el nodo
+  isCoreTarjeta?: boolean;  // Used by SleepBox Tabla loader (core row vs linked source)
 }
 
 /**
@@ -30,9 +34,10 @@ export interface GraphNode {
 export interface GraphLink {
   source: string;
   target: string;
-  relationType: string;           // New richer field (preferred)
-  type?: 'child' | 'mention' | 'relation'; // Legacy - will be phased out
-  sourceProperty?: string;        // Name of the Notion relation property (when explicit)
+  relationType: RelationType;           // Tipo canónico de relación (ver relationTypes.ts)
+  sourceProperty?: string;              // Nombre original de la columna en Notion (cuando es explícita)
+  category?: RelationCategory;          // membership | support | contradiction | generic
+  semanticLabel?: string;               // Etiqueta lista para mostrar en UI
 }
 
 export async function fetchPage(pageId: string): Promise<any> {
@@ -168,7 +173,7 @@ export async function fetchDirectRelations(nodeId: string): Promise<{ nodes: Gra
             source: nodeId,
             target: childId,
             relationType: 'child_page',
-            type: 'child',
+            semanticLabel: 'Página hija',
           });
         }
 
@@ -189,7 +194,7 @@ export async function fetchDirectRelations(nodeId: string): Promise<{ nodes: Gra
               source: nodeId,
               target: mentionedId,
               relationType: 'mention',
-              type: 'mention',
+              semanticLabel: 'Mención en contenido',
             });
           }
         }
@@ -250,18 +255,12 @@ export async function buildGraphFromPage(
     }
   }
 
-  const rootTitle = isDatabase 
-    ? (rootEntity.title?.[0]?.plain_text || 'Untitled Database')
-    : extractTitle(rootEntity);
 
-  const rootType = isDatabase ? 'database' : 'page';
 
-  nodes.push({
-    id: rootEntity.id,
-    label: rootTitle,
-    type: rootType,
-    notionUrl: rootEntity.url,
-  });
+  // We will decide later (after querying the DB) whether to add the root as a
+  // strong central node or use a lighter "DB" hub for Sleep Box style structures.
+  // For now we always add it, but with a modified label when it's a Sleep Box DB.
+  // The real "concept centering" improvement will come from stronger Temáticas clustering (see below).
 
   let isLargeDatabase = false;
 
@@ -276,6 +275,19 @@ export async function buildGraphFromPage(
 
       // For large databases, only create nodes for the rows but skip deep recursion by default
       const shouldRecurse = !options.shallowDatabase;
+
+      const dbTitle = rootEntity?.title?.[0]?.plain_text || rootEntity?.name || 'Database';
+      const allPropNames = Object.keys(rows[0]?.properties || {});
+      const isSleepBox = isSleepBoxDatabase(dbTitle, allPropNames);
+
+      if (isSleepBox) {
+        console.log(`[Sleep Box] Detectada base principal según convención del usuario: "${dbTitle}"`);
+      }
+
+      // Diagnóstico detallado de schema (muy útil para tu Sleep Box)
+      if (rows.length > 0) {
+        debugPrintSchemaAnalysis(dbTitle, rows[0].properties);
+      }
 
       // Detectar si esta base tiene una columna de "Temáticas" (o similar)
       const tematicaPropName = Object.keys(rows[0]?.properties || {}).find(
@@ -319,6 +331,7 @@ export async function buildGraphFromPage(
             type: 'page',
             notionUrl: row.url,
             group,
+            isCoreTarjeta: true,   // This row is an actual entry in the Tabla/Sleep Box, not a linked source
           });
         }
 
@@ -338,20 +351,29 @@ export async function buildGraphFromPage(
                 });
               }
 
+              const normalizedType = normalizeExplicitRelationType(propName);
+              const category = getRelationCategory(propName, normalizedType);
+              const semanticLabel = getSemanticLabel(normalizedType, propName);
+
               links.push({
                 source: row.id,
                 target: targetId,
-                relationType: `explicit:${propName.toLowerCase().replace(/\s+/g, '_')}`,
+                relationType: normalizedType,
+                sourceProperty: propName,
+                category,
+                semanticLabel,
               });
             }
           }
         }
 
-        // Link de la fila a la base
+        // Link de la fila a la base (genérico)
         links.push({
           source: rootEntity.id,
           target: row.id,
           relationType: 'explicit:database_row',
+          category: 'membership',
+          semanticLabel: 'Fila de Sleep Box',
         });
 
         if (shouldRecurse) {
@@ -406,7 +428,7 @@ async function traverseBlock(
             source: parentId,
             target: childId,
             relationType: 'child_page',
-            type: 'child',
+            semanticLabel: 'Página hija',
           });
 
           // Recurse
@@ -432,7 +454,7 @@ async function traverseBlock(
               source: parentId,
               target: mentionedId,
               relationType: 'mention',
-              type: 'mention',
+              semanticLabel: 'Mención en contenido',
             });
           }
         }
@@ -449,6 +471,84 @@ async function traverseBlock(
   } catch (err) {
     console.error('Error traversing block', blockId, err);
   }
+}
+
+/**
+ * Detecta si una base de datos parece ser la "Sleep Box" principal del usuario
+ * según la convención que describió:
+ * - Tiene una columna de relación llamada "Tarjetas" (o muy similar)
+ * - O el título de la DB contiene "Sleep Box", "Temas", "Conceptual", etc.
+ */
+export function isSleepBoxDatabase(dbTitle: string, propertyNames: string[]): boolean {
+  const titleLower = (dbTitle || '').toLowerCase();
+
+  const looksLikeSleepBoxByTitle =
+    titleLower.includes('sleep box') ||
+    titleLower.includes('temas conceptual') ||
+    titleLower.includes('mapa de conocimiento') ||
+    titleLower.includes('caja de sueño'); // por si traduce
+
+  const hasTarjetasColumn = propertyNames.some(name => {
+    const n = name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    return n === 'tarjetas' || n === 'tarjeta' || n.includes('tarjeta');
+  });
+
+  return looksLikeSleepBoxByTitle || hasTarjetasColumn;
+}
+
+/**
+ * Función de diagnóstico potente.
+ * Llamala cuando cargues tu Sleep Box para ver exactamente cómo se interpreta cada columna.
+ * 
+ * Uso recomendado:
+ * 1. npm run dev
+ * 2. Pegá el ID de tu base en la UI
+ * 3. Mirá la consola del navegador (F12) → vas a ver un bloque muy legible
+ */
+export function debugPrintSchemaAnalysis(
+  dbTitle: string,
+  properties: Record<string, any>
+) {
+  const propNames = Object.keys(properties);
+  const isSleepBox = isSleepBoxDatabase(dbTitle, propNames);
+
+  console.groupCollapsed(`%c[Sleep Box Schema Analysis] ${dbTitle}`, 'color:#f59e0b; font-weight:bold');
+
+  console.log('¿Detectada como Sleep Box principal?', isSleepBox ? '✅ SÍ' : '❌ NO');
+  console.log('Total de propiedades:', propNames.length);
+
+  console.table(
+    propNames.map((name) => {
+      const prop = properties[name];
+      const normalized = normalizeExplicitRelationType(name);
+      const category = getRelationCategory(name, normalized);
+      const label = getSemanticLabel(normalized, name);
+
+      return {
+        'Columna original': name,
+        'Tipo Notion': prop?.type || '?',
+        'RelationType': normalized,
+        'Categoría': category,
+        'Etiqueta semántica': label,
+      };
+    })
+  );
+
+  // Resumen por categoría
+  const byCategory: Record<string, string[]> = {};
+  propNames.forEach((name) => {
+    const norm = normalizeExplicitRelationType(name);
+    const cat = getRelationCategory(name, norm);
+    if (!byCategory[cat]) byCategory[cat] = [];
+    byCategory[cat].push(name);
+  });
+
+  console.log('%cResumen por categoría semántica:', 'font-weight:bold');
+  Object.entries(byCategory).forEach(([cat, cols]) => {
+    console.log(`  ${cat.toUpperCase().padEnd(14)} → ${cols.join(' | ')}`);
+  });
+
+  console.groupEnd();
 }
 
 function extractTitle(page: any): string {
@@ -470,4 +570,75 @@ function extractTitle(page: any): string {
   }
 
   return 'Untitled';
+}
+
+/**
+ * Extrae la lista actual de Temas de alto nivel desde la propiedad "Temáticas" (rich_text).
+ * 
+ * En el setup del usuario, esta propiedad está muy esparsa: solo unas pocas filas
+ * tienen el nombre del tema cargado. Esas filas actúan como "definición" de los temas actuales.
+ * 
+ * Esta función es barata de llamar y es la que usaremos para refrescar la lista de temas
+ * cuando detectemos un prefijo de temática nuevo en una tarjeta.
+ */
+export async function discoverHighLevelThemesFromSparseProperty(
+  databaseId: string,
+  tematicasPropertyName = 'Temáticas'
+): Promise<string[]> {
+  const cleanId = databaseId.replace(/-/g, '');
+  const themes = new Set<string>();
+
+  try {
+    let hasMore = true;
+    let cursor: string | undefined;
+
+    while (hasMore) {
+      const body: any = { page_size: 100 };
+      if (cursor) body.start_cursor = cursor;
+
+      const res = await fetch(`${API_BASE}/databases/${cleanId}/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        console.warn('discoverHighLevelThemesFromSparseProperty: query failed', res.status);
+        break;
+      }
+
+      const data = await res.json();
+
+      for (const row of data.results || []) {
+        const prop = row.properties?.[tematicasPropertyName];
+        if (prop?.type === 'rich_text') {
+          const value = prop.rich_text?.map((t: any) => t.plain_text || '').join('').trim();
+          if (value) {
+            themes.add(value);
+          }
+        }
+      }
+
+      hasMore = data.has_more;
+      cursor = data.next_cursor;
+    }
+  } catch (err) {
+    console.error('Error discovering high-level themes:', err);
+  }
+
+  return Array.from(themes).sort();
+}
+
+/**
+ * Intenta extraer el tema de alto nivel a partir del prefijo del título de una Tarjeta.
+ * Ejemplos: "1a Algo" → "1", "3e7d OSINT..." → "3", "2a1 foo" → "2"
+ */
+export function extractThemePrefixFromTitle(title: string): string | null {
+  const match = title.match(/^(\d+[a-zA-Z0-9]*)/);
+  if (!match) return null;
+
+  // Normalizamos un poco: "1a", "1A", "1a1" → grupo principal "1"
+  const raw = match[1];
+  const mainNumber = raw.match(/^\d+/);
+  return mainNumber ? mainNumber[0] : raw;
 }

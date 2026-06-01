@@ -3,7 +3,7 @@ import ForceGraph2D from 'react-force-graph-2d';
 import { buildGraphFromPage, fetchDirectRelations } from '../lib/notion';
 import { InMemoryPageCache } from '../lib/cache';
 import { getOrRefreshHighLevelThemes, processTarjetasForThemes } from '../lib/themeInference';
-import * as sqliteCache from '../lib/sqliteCache'; // real SQLite cache for debugging + node positions persistence
+import * as sqliteCache from '../lib/sqliteCache'; // real SQLite cache for debugging + SleepBox DB loader + positions in main DB
 
 export default function GraphDemo() {
   const [graphData, setGraphData] = useState<any>(null);
@@ -19,6 +19,13 @@ export default function GraphDemo() {
     x: number;
     y: number;
   } | null>(null);
+
+  // === New DB-first mode for SleepBox ===
+  // Load the exported SleepBox_Graph_Ready_*.sqlite and keep everything (including pins) in it.
+  const [isDbMode, setIsDbMode] = useState(false);
+  const [dbFileName, setDbFileName] = useState<string | null>(null);
+  const loadedDbRef = useRef<any>(null); // the sql.js Database instance for the big SleepBox file
+  const [isLoadingDb, setIsLoadingDb] = useState(false);
   const fgRef = useRef<any>(null);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
   const [loadDepth, setLoadDepth] = useState(3);
@@ -81,20 +88,29 @@ export default function GraphDemo() {
 
   const currentData = graphData || demoData;
 
-  // Configurar fuerzas del grafo (incluyendo el nuevo control de Node Charge)
+  // Configurar fuerzas del grafo
+  // Special handling for theme hubs: much stronger repulsion so the galaxies stay visibly separated.
   useEffect(() => {
     const fg = fgRef.current;
     if (!fg || !currentData?.nodes) return;
 
     const nodeCount = currentData.nodes.length;
 
-    // Usar el valor del slider cuando esté disponible, con fallback adaptativo
     const baseCharge = visualSettings.nodeCharge ?? (nodeCount > 300 ? -140 : -70);
-    fg.d3Force('charge')?.strength(baseCharge);
 
-    // Link distance también un poco más generoso en grafos grandes
-    const linkDistance = nodeCount > 300 ? 55 : 32;
-    fg.d3Force('link')?.distance(linkDistance);
+    // Per-node charge: theme hubs get very strong repulsion so they act as distinct centers
+    fg.d3Force('charge')?.strength((node: any) => {
+      if (node.isVirtualTheme) {
+        return -900; // strong separation between the 10 temáticas
+      }
+      return baseCharge;
+    });
+
+    // Make virtual theme links longer so cards hang farther from the hub
+    fg.d3Force('link')?.distance((link: any) => {
+      if (link.isVirtual) return 180;
+      return nodeCount > 300 ? 55 : 32;
+    });
 
     fg.d3ReheatSimulation?.();
   }, [currentData, visualSettings.nodeCharge]);
@@ -291,16 +307,18 @@ export default function GraphDemo() {
       setGraphData(formatted);
       setSelectedNode(null);
 
-      // Apply any previously pinned positions (from SQLite cache)
-      // This makes manual layout survive page reloads
-      setTimeout(async () => {
-        try {
-          await sqliteCache.applySavedPositionsToNodes(finalNodes);
-          if (fgRef.current?.refresh) fgRef.current.refresh();
-        } catch (e) {
-          console.warn('Failed to apply saved node positions', e);
-        }
-      }, 80);
+      // In DB mode positions are already applied by applyPositionsFromSleepBoxDb right after buildGraph.
+      // This old path is only for the small debug cache when not in DB mode.
+      if (!loadedDbRef.current) {
+        setTimeout(async () => {
+          try {
+            await sqliteCache.applySavedPositionsToNodes(finalNodes);
+            if (fgRef.current?.refresh) fgRef.current.refresh();
+          } catch (e) {
+            console.warn('Failed to apply saved node positions', e);
+          }
+        }, 80);
+      }
     } catch (err: any) {
       console.error(err);
       let friendlyMessage = err.message || 'Failed to load from Notion.';
@@ -317,42 +335,124 @@ export default function GraphDemo() {
     }
   };
 
-  // Auto-load the user's default Tabla view once on startup
+  // === Auto-load behavior changed for testing ===
+  // By default we now prefer loading from the local SleepBox SQLite (cache visualization).
+  // No more automatic Notion queries on every browser refresh while we tune the viz.
+  // User drops the exported .sqlite once, and on subsequent refreshes we can restore from IndexedDB (future)
+  // or they re-drop the file. "Refrescar" buttons will re-enable live Notion later.
   const hasAutoLoadedRef = useRef(false);
-  const DEFAULT_DB_ID = 'c51020805fb849e7a9e41208cae7cdc1';
 
-  useEffect(() => {
-    if (!hasAutoLoadedRef.current) {
-      hasAutoLoadedRef.current = true;
+  // Disabled the old auto Notion load for DB-first workflow.
+  // useEffect(() => { ... handleLoadReal ... }) commented out intentionally.
 
-      // Force the default ID and trigger load
-      setPageInput(DEFAULT_DB_ID);
+  // Load a SleepBox unified DB file (the one generated by build_clean_fresh_graph.js etc.)
+  const handleLoadSleepBoxFile = async (file: File) => {
+    setIsLoadingDb(true);
+    setError(null);
+    try {
+      const { db, fileName } = await sqliteCache.loadSleepBoxDatabaseFromFile(file);
 
-      const timer = setTimeout(() => {
-        // Call directly with the ID to avoid any closure/state timing issues
-        handleLoadReal(DEFAULT_DB_ID);
-      }, 300);
+      const graph = sqliteCache.buildGraphFromSleepBoxDb(db);
 
-      return () => clearTimeout(timer);
+      // Apply any previously pinned positions that live inside this same DB file
+      const applied = sqliteCache.applyPositionsFromSleepBoxDb(db, graph.nodes);
+
+      // Keep reference to the DB so we can write positions back into it
+      loadedDbRef.current = db;
+      setDbFileName(fileName);
+      setIsDbMode(true);
+
+      const formatted = {
+        nodes: graph.nodes,
+        links: graph.links,
+      };
+
+      setGraphData(formatted);
+      setSelectedNode(null);
+      setThemeDebugInfo(null); // old Notion theme debug not relevant in pure DB mode
+
+      console.log(`%c[SleepBox DB] Loaded ${graph.totalNodes} nodes + ${graph.themeCount} theme galaxies from ${fileName}. Positions applied: ${applied}`, 'color:#22c55e');
+
+      // Optional: store bytes for "auto load on refresh" (simple IndexedDB)
+      try {
+        const buf = await file.arrayBuffer();
+        // Reuse the existing pattern - store under a dedicated key for big DB
+        // (the existing saveToIndexedDB is stubbed, so we do a quick direct one here)
+        const idb = await openSimpleIdb();
+        const tx = idb.transaction(['sleepbox'], 'readwrite');
+        tx.objectStore('sleepbox').put({ key: 'last-db', data: new Uint8Array(buf), name: fileName, ts: Date.now() });
+      } catch (e) { /* non critical */ }
+
+    } catch (err: any) {
+      console.error(err);
+      setError('Failed to load SleepBox SQLite: ' + (err.message || err));
+    } finally {
+      setIsLoadingDb(false);
     }
-  }, []); // run only once, handleLoadReal will use the updated pageInput
+  };
+
+  // Quick IndexedDB helper for auto-restore of last SleepBox DB on browser refresh
+  async function openSimpleIdb() {
+    return new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open('sleepbox-viz-db', 1);
+      req.onupgradeneeded = () => {
+        const idb = req.result;
+        if (!idb.objectStoreNames.contains('sleepbox')) idb.createObjectStore('sleepbox', { keyPath: 'key' });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = reject;
+    });
+  }
+
+  // Try to auto-restore last SleepBox DB on mount (so "al reiniciar el server" it loads from "the cache")
+  useEffect(() => {
+    if (hasAutoLoadedRef.current) return;
+    hasAutoLoadedRef.current = true;
+
+    (async () => {
+      try {
+        const idb = await openSimpleIdb();
+        const tx = idb.transaction(['sleepbox'], 'readonly');
+        const getReq = tx.objectStore('sleepbox').get('last-db');
+        getReq.onsuccess = async () => {
+          const record = getReq.result;
+          if (record?.data) {
+            // Reconstruct a File-like for the loader
+            const blob = new Blob([record.data]);
+            const fakeFile = new File([blob], record.name || 'SleepBox_Last.sqlite', { type: 'application/x-sqlite3' });
+            console.log('%c[SleepBox DB] Auto-restoring last DB from browser storage...', 'color:#eab308');
+            await handleLoadSleepBoxFile(fakeFile);
+          }
+        };
+      } catch (e) {
+        // no previous DB or IndexedDB not available — user will drop the file manually
+      }
+    })();
+  }, []);
 
   const handleNodeClick = async (node: any) => {
     setSelectedNode(node);
 
-    // If already expanded, just select it
+    // In pure DB / cache visualization mode we don't do live Notion expansion.
+    // All data (nodes + edges) is already in the loaded SQLite.
+    // This prevents the previous bug where touching a node would make the viz collapse or disappear.
+    if (isDbMode || loadedDbRef.current) {
+      // Still allow selecting and showing context menu via right click
+      return;
+    }
+
+    // === Below is the old live expansion path (for when we re-enable Notion refreshes) ===
     if (expandedNodes.has(node.id)) {
       return;
     }
 
-    // Mark as expanded immediately for UI feedback
     setExpandedNodes(prev => new Set(prev).add(node.id));
 
     try {
       const { nodes: newNodes, links: newLinks } = await fetchDirectRelations(node.id);
 
       if (newNodes.length === 0 && newLinks.length === 0) {
-        return; // Nothing new to add
+        return;
       }
 
       setGraphData((prev: any) => {
@@ -373,14 +473,12 @@ export default function GraphDemo() {
         };
       });
 
-      // Reheat the simulation so new nodes get positioned nicely
       setTimeout(() => {
         fgRef.current?.d3ReheatSimulation?.();
       }, 50);
 
     } catch (err) {
       console.error('Failed to expand node', node.id, err);
-      // Remove from expanded set if it failed
       setExpandedNodes(prev => {
         const next = new Set(prev);
         next.delete(node.id);
@@ -395,11 +493,15 @@ export default function GraphDemo() {
     node.fx = node.x;
     node.fy = node.y;
 
-    // Persist to SQLite (survives reloads)
-    try {
-      await sqliteCache.saveNodePosition(node.id, node.x, node.y);
-    } catch (e) {
-      console.warn('Could not persist node position to SQLite cache', e);
+    // Persist into the main SleepBox DB if loaded (preferred, travels with your file)
+    if (loadedDbRef.current) {
+      sqliteCache.savePositionToSleepBoxDb(loadedDbRef.current, node.id, node.x, node.y);
+    } else {
+      try {
+        await sqliteCache.saveNodePosition(node.id, node.x, node.y);
+      } catch (e) {
+        console.warn('Could not persist node position', e);
+      }
     }
 
     // Force a refresh so the UI reflects the pinned state if needed
@@ -416,15 +518,18 @@ export default function GraphDemo() {
       delete node.fy;
     });
 
-    // Also clear persisted positions
-    try {
-      await sqliteCache.unpinAllNodes();
-    } catch (e) {
-      console.warn('Could not clear persisted positions', e);
+    if (loadedDbRef.current) {
+      sqliteCache.unpinAllInSleepBoxDb(loadedDbRef.current);
+    } else {
+      try {
+        await sqliteCache.unpinAllNodes();
+      } catch (e) {
+        console.warn('Could not clear persisted positions', e);
+      }
     }
 
     // Reheat simulation so nodes can move again
-    setGraphData({ ...graphData }); // trigger re-render
+    setGraphData({ ...graphData });
     setTimeout(() => {
       fgRef.current?.d3ReheatSimulation?.();
     }, 10);
@@ -455,9 +560,14 @@ export default function GraphDemo() {
     if (!node) return;
     node.fx = node.x;
     node.fy = node.y;
-    try {
-      await sqliteCache.saveNodePosition(node.id, node.x, node.y);
-    } catch (e) {}
+
+    // If we have a loaded main SleepBox DB, write the position into it (preferred)
+    if (loadedDbRef.current) {
+      sqliteCache.savePositionToSleepBoxDb(loadedDbRef.current, node.id, node.x, node.y);
+    } else {
+      try { await sqliteCache.saveNodePosition(node.id, node.x, node.y); } catch (e) {}
+    }
+
     if (fgRef.current?.refresh) fgRef.current.refresh();
     closeContextMenu();
   };
@@ -466,9 +576,13 @@ export default function GraphDemo() {
     if (!node) return;
     delete node.fx;
     delete node.fy;
-    try {
-      await sqliteCache.unpinNode(node.id);
-    } catch (e) {}
+
+    if (loadedDbRef.current) {
+      sqliteCache.unpinNodeInSleepBoxDb(loadedDbRef.current, node.id);
+    } else {
+      try { await sqliteCache.unpinNode(node.id); } catch (e) {}
+    }
+
     if (fgRef.current?.refresh) fgRef.current.refresh();
     closeContextMenu();
   };
@@ -477,24 +591,68 @@ export default function GraphDemo() {
     <div className="flex h-[calc(100vh-120px)] gap-4 p-4">
       {/* Graph Area */}
       <div className="flex-1 graph-container flex flex-col">
-        <div className="p-3 border-b border-[#2a2d36] flex items-center gap-3 bg-[#16181f]">
-          <input
-            type="text"
-            value={pageInput}
-            onChange={(e) => setPageInput(e.target.value)}
-            placeholder="Paste Notion page URL or ID (e.g. 123e4567-e89b-12d3-a456-426614174000)"
-            className="input flex-1"
-            onKeyDown={(e) => e.key === 'Enter' && handleLoadReal()}
-          />
-          <button 
-            onClick={() => handleLoadReal()} 
-            disabled={isLoading}
-            className="btn"
-          >
-            {isLoading ? 'Loading...' : 'Load Real Graph'}
-          </button>
+        <div className="p-3 border-b border-[#2a2d36] flex items-center gap-3 bg-[#16181f] flex-wrap">
+          {/* DB-first controls for SleepBox - "visualización del cache" */}
+          <label className="btn cursor-pointer">
+            {isLoadingDb ? 'Loading DB...' : 'Load SleepBox SQLite file'}
+            <input
+              type="file"
+              accept=".sqlite,application/x-sqlite3"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleLoadSleepBoxFile(f);
+                // allow selecting the same file again
+                (e.target as HTMLInputElement).value = '';
+              }}
+            />
+          </label>
 
-          {/* Depth control - user request */}
+          {isDbMode && dbFileName && (
+            <>
+              <span className="text-xs px-2 py-1 bg-emerald-900/40 text-emerald-400 rounded">
+                DB: {dbFileName}
+              </span>
+              <button
+                onClick={() => {
+                  if (loadedDbRef.current) {
+                    sqliteCache.exportSleepBoxDb(loadedDbRef.current, dbFileName.replace(/\.sqlite$/, ''));
+                  }
+                }}
+                className="btn-secondary px-3 py-1 text-xs"
+                title="Download the current DB including any newly pinned node positions (saved inside the file)"
+              >
+                Export DB with layout
+              </button>
+              <button
+                onClick={unpinAllNodes}
+                className="btn-secondary px-3 py-1 text-xs"
+              >
+                Unpin all
+              </button>
+            </>
+          )}
+
+          {/* Old Notion controls kept for future "Refrescar" */}
+          <div className="flex items-center gap-2 ml-2 border-l border-[#3a3f4a] pl-3">
+            <input
+              type="text"
+              value={pageInput}
+              onChange={(e) => setPageInput(e.target.value)}
+              placeholder="Notion ID (for future refresh)"
+              className="input w-64 text-xs"
+            />
+            <button
+              onClick={() => handleLoadReal()}
+              disabled={isLoading}
+              className="btn-secondary text-xs px-2 py-1"
+              title="Live Notion fetch (will be used for 'Refrescar todo' / 'Refrescar tema' later)"
+            >
+              {isLoading ? '...' : 'Refresh from Notion (future)'}
+            </button>
+          </div>
+
+          {/* Depth (only for live Notion mode) */}
           <div className="flex items-center gap-1.5 text-xs text-[#6b7280]">
             <span>Depth</span>
             <input
@@ -509,7 +667,7 @@ export default function GraphDemo() {
 
           {graphData && (
             <button onClick={resetToDemo} className="btn-secondary px-3 py-1.5 text-xs">
-              Back to Demo
+              Reset
             </button>
           )}
         </div>
@@ -608,10 +766,19 @@ export default function GraphDemo() {
               const isExpanded = expandedNodes.has(node.id);
 
               // Draw node circle
-              ctx.beginPath();
-              ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI, false);
-              ctx.fillStyle = isDatabase ? '#10b981' : '#3b82f6';
-              ctx.fill();
+              if (node.isVirtualTheme) {
+                // Theme hubs: distinct look (rounded square-ish) + gold to clearly separate galaxies
+                ctx.fillStyle = '#f59e0b';
+                ctx.beginPath();
+                const s = radius * 1.1;
+                ctx.roundRect(node.x - s, node.y - s, s * 2, s * 2, 4 / globalScale);
+                ctx.fill();
+              } else {
+                ctx.beginPath();
+                ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI, false);
+                ctx.fillStyle = isDatabase ? '#10b981' : '#3b82f6';
+                ctx.fill();
+              }
 
               // Draw white ring for selected/hovered
               if (selectedNode?.id === node.id || hoveredNode?.id === node.id) {
@@ -756,7 +923,11 @@ export default function GraphDemo() {
         <h3 className="font-semibold text-lg mb-2">Notion Graph</h3>
         <div className="text-xs text-[#6b7280] mb-4 flex items-center justify-between">
           <span>
-            {graphData ? 'Real data from your Tabla view (with theme galaxies)' : 'Demo mode — click "Load Real Graph" after setting up your token'}
+            {isDbMode 
+              ? `Loaded from local DB (${dbFileName}) — pins saved inside the file` 
+              : graphData 
+                ? 'Real data (live or demo)' 
+                : 'Drop your exported SleepBox_*.sqlite to start (DB-first mode for tuning)'}
           </span>
           {currentData?.nodes && (
             <span className="font-mono bg-[#0f1117] px-1.5 py-0.5 rounded text-[10px]">
@@ -781,7 +952,9 @@ export default function GraphDemo() {
           </div>
           <div className="mt-3 text-[10px] text-[#6b7280]">
             Labels appear on hover or when zoomed in.<br />
-            Yellow dot = Click to expand relations.
+            {isDbMode 
+              ? 'DB mode: all data static. Right-click node for menu (Open in Notion, Pin).'
+              : 'Yellow dot = Click to expand relations (live Notion).'}
           </div>
 
           <div className="mt-2 text-[10px]">
